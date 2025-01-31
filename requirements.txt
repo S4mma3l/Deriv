@@ -1,0 +1,7 @@
+numpy
+pandas
+scikit-learn
+tensorflow
+deriv-api
+rich
+aiohttp
