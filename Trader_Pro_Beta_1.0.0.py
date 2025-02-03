@@ -14,6 +14,8 @@ from rich.style import Style
 import aiohttp
 import pandas as pd
 from tensorflow.keras.optimizers import Adam
+import json
+import random
 
 # --- Configuración mejorada ---
 API_TOKEN = os.getenv("DERIV_TOKEN", "YOUR_DERIV_TOKEN")  # Reemplaza con tu token
@@ -37,6 +39,9 @@ TAKE_PROFIT_PERCENTAGE = float(os.getenv("TAKE_PROFIT_PERCENTAGE", 0.1))  # 10%
 TRADE_FREQUENCY = 300  # Ejecutar un trade cada 5 minutos en segundos
 MAX_OPEN_TRADES = 3
 CONFIDENCE_THRESHOLD = 0.6 # Nivel de confianza inicial
+INITIAL_LEARNING_RATE = 0.001
+DATA_FILE = "market_data.json"
+MAX_HISTORICAL_DATA = 100
 
 # --- Inicialización de componentes ---
 console = Console()
@@ -111,26 +116,26 @@ def create_model():
     """Crea o carga el modelo LSTM mejorado."""
     if os.path.exists(MODEL_PATH):
         model = load_model(MODEL_PATH)
-        model.compile(optimizer=Adam(learning_rate=0.0005), loss='mse')
+        model.compile(optimizer=Adam(learning_rate=INITIAL_LEARNING_RATE), loss='mse')
         console.print("[bold blue]Modelo cargado desde disco.[/bold blue]")
         return model
 
     model = Sequential([
         Input(shape=(60, 6)),  # 6 características por entrada ahora
-        LSTM(128, return_sequences=True, activation='tanh'),
-        Dropout(0.2),
-        LSTM(64, return_sequences=True, activation='tanh'),
-        Dropout(0.2),
-        LSTM(32, activation='tanh'),
-        Dropout(0.2),
-        Dense(16, activation='relu'),
+        LSTM(128, return_sequences=True, activation='tanh', kernel_initializer='glorot_uniform'),
+        Dropout(0.3),
+        LSTM(64, return_sequences=True, activation='tanh', kernel_initializer='glorot_uniform'),
+        Dropout(0.3),
+        LSTM(32, activation='tanh', kernel_initializer='glorot_uniform'),
+        Dropout(0.3),
+        Dense(16, activation='relu', kernel_initializer='glorot_uniform'),
         Dense(1)
     ])
-    model.compile(optimizer=Adam(learning_rate=0.0005), loss='mse')
+    model.compile(optimizer=Adam(learning_rate=INITIAL_LEARNING_RATE), loss='mse')
     console.print("[bold blue]Nuevo modelo creado.[/bold blue]")
     return model
 
-def train_model(model, data, epochs=20):
+def train_model(model, data, epochs=30):
     """Entrena el modelo LSTM con los datos proporcionados."""
     if len(data) < 61:
         return model
@@ -148,7 +153,7 @@ def train_model(model, data, epochs=20):
     X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
 
     # Callbacks para Early Stopping y Model Checkpoint
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    early_stopping = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
     model_checkpoint = ModelCheckpoint(MODEL_PATH, monitor='val_loss', save_best_only=True)
 
     model.fit(
@@ -356,7 +361,7 @@ def update_confidence(trade_history):
     
     if (wins + losses) > 0:
       win_ratio = wins / (wins + losses)
-      confidence_change = (win_ratio - confidence_level) * 0.1 # Ajustar la tasa de aprendizaje
+      confidence_change = (win_ratio - confidence_level) * 0.15 # Ajustar la tasa de aprendizaje
       confidence_level = min(max(0.1, confidence_level + confidence_change), 1) # Rango de 0.1 a 1
     
     confidence_history.append({"time": time.time(), "confidence": confidence_level})
@@ -387,6 +392,109 @@ def adjust_trading_parameters():
 
         console.print(f"[bold cyan]Parámetros ajustados: Frecuencia: {TRADE_FREQUENCY}, Umbral: {MIN_DIFF_THRESHOLD}[/bold cyan]")
 
+def save_market_analysis(data, file_path=DATA_FILE):
+    """Guarda los datos de análisis del mercado en un archivo."""
+    with open(file_path, 'w') as f:
+        json.dump(data, f)
+    
+def load_market_analysis(file_path=DATA_FILE):
+    """Carga los datos de análisis del mercado desde un archivo."""
+    try:
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def update_and_save_analysis(prices, scaled_data, scaler, current_price, predicted_price, trend, confidence_level):
+    """Actualiza y guarda el análisis del mercado."""
+    try:
+      # Crear un diccionario con la información a guardar
+      data = {
+          "prices": prices.tolist(),
+          "scaled_data": scaled_data.tolist(),
+          "current_price": current_price,
+          "predicted_price": predicted_price,
+          "trend": trend,
+          "confidence_level": confidence_level,
+          "timestamp": time.time()
+      }
+      
+      historic_data = load_market_analysis()
+      historic_data.append(data)
+      # Limitar la cantidad de información guardada
+      if len(historic_data) > MAX_HISTORICAL_DATA:
+        historic_data = historic_data[-MAX_HISTORICAL_DATA:] # Mantener los mas recientes
+      save_market_analysis(historic_data)
+      console.print("[bold green]✅ Análisis del mercado guardado.[/bold green]")
+      return True
+    except Exception as e:
+      console.print(f"[bold red]⚠ Error al guardar el análisis del mercado: {str(e)}[/bold red]")
+      return False
+
+def load_and_adjust_from_history(trade_history):
+    """Carga y utiliza la historia de trades para ajustar parámetros."""
+    global confidence_level
+    
+    historic_data = load_market_analysis()
+    if historic_data:
+        # Ajustar la confianza inicial a partir de los datos históricos.
+        last_confidence_value = historic_data[-1]['confidence_level'] if historic_data else 0.5
+        confidence_level = last_confidence_value
+        console.print(f"[bold cyan]Confianza inicial del bot cargada: {confidence_level:.2f}[/bold cyan]")
+    else:
+        console.print(f"[bold yellow]No se encontró información histórica, se usará configuración inicial.[/bold yellow]")
+        # Si no hay datos historicos, crear una entrada inicial
+        initial_data = {
+            "prices": [],
+            "scaled_data": [],
+            "current_price": 0,
+            "predicted_price": 0,
+            "trend": 'neutral',
+            "confidence_level": confidence_level,
+            "timestamp": time.time()
+        }
+        save_market_analysis([initial_data])
+        console.print(f"[bold yellow]Datos iniciales para el aprendizaje guardados.[/bold yellow]")
+
+    return
+    
+def learn_from_trade(contract_id, trade_status):
+    """Aprende de una operación exitosa o fallida."""
+    global confidence_level
+    try:
+      historic_data = load_market_analysis()
+      # Buscar los datos de mercado por timestamp o contract_id
+      if not historic_data:
+        console.print(f"[bold yellow]No hay datos historicos para aprender del trade[/bold yellow]")
+        return
+        
+      trade_info = open_trades.get(contract_id)
+      if not trade_info:
+          console.print(f"[bold yellow]No hay información de trade con ese contract_id: {contract_id}[/bold yellow]")
+          return
+      
+      trade_time = trade_info['start_time'] # Obtener el timestamp del trade para buscar los datos
+      
+      for idx, data in enumerate(historic_data):
+        if data['timestamp'] >= trade_time:
+            # Obtener la data de mercado
+            if trade_status == "win":
+                confidence_level = min(1, confidence_level + 0.1*data['confidence_level']) # Aumentar la confianza
+                console.print(f"[bold green]✅ Aprendiendo de trade exitoso. Nueva confianza: {confidence_level}[/bold green]")
+                
+            elif trade_status == "loss":
+                confidence_level = max(0.1, confidence_level - 0.1*data['confidence_level']) # Reducir la confianza
+                console.print(f"[bold red]❌ Aprendiendo de trade fallido. Nueva confianza: {confidence_level}[/bold red]")
+            
+            # Eliminar los datos utilizados (opcional)
+            del historic_data[idx]
+            save_market_analysis(historic_data)
+            
+            return # Detener la búsqueda
+            
+      console.print(f"[bold yellow]No se encontraron datos para aprender del trade: {contract_id}[/bold yellow]")
+    except Exception as e:
+        console.print(f"[bold red]⚠ Error aprendiendo del trade: {str(e)}[/bold red]")
 
 async def trading_strategy():
     """Función principal que ejecuta la estrategia de trading."""
@@ -405,6 +513,9 @@ async def trading_strategy():
 
         model = create_model()
         scaler = None
+
+         # Cargar datos historicos al inicio.
+        load_and_adjust_from_history(trade_history)
 
         while True:
             current_time = time.time()
@@ -445,6 +556,8 @@ async def trading_strategy():
                         direction = "PUT"
                     
                     if direction:
+                        # Guardar los datos antes de ejecutar el trade
+                        update_and_save_analysis(prices, scaled_data, scaler, current_price, predicted_price, trend, confidence_level)
                         contract_id = await execute_trade(direction, balance, SYMBOL, predicted_price, current_price, confidence_level)
                         if contract_id:
                             console.print(f"[bold magenta]💰 Balance (antes del trade): {balance:.2f} USD[/bold magenta]")  # Imprimir antes del trade
@@ -453,6 +566,11 @@ async def trading_strategy():
                             if trade_closed:
                                 balance = await get_balance(account_id) or balance
                                 console.print(f"[bold magenta]💰 Balance (después del trade): {balance:.2f} USD[/bold magenta]")  # Imprimir después del trade
+                                # Aprender del trade después de cerrar
+                                if trade_history[-1]['status'] == 'win':
+                                    learn_from_trade(contract_id, 'win')
+                                elif trade_history[-1]['status'] == 'loss':
+                                    learn_from_trade(contract_id, 'loss')
                             else:
                                 console.print(f"[bold red]Fallo en el monitoreo/cierre del trade.")
                             last_trade_time = current_time

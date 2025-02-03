@@ -18,13 +18,11 @@ from tensorflow.keras.optimizers import Adam
 # --- Configuración mejorada ---
 API_TOKEN = os.getenv("DERIV_TOKEN", "YOUR_DERIV_TOKEN")  # Reemplaza con tu token
 APP_ID = int(os.getenv("APP_ID", 67991))  # Reemplaza con tu App ID
-SYMBOL = os.getenv("SYMBOL", "cryBTCUSD")  # Símbolo por defecto ahora es BTC/USD
+SYMBOL = os.getenv("SYMBOL", "1HZ50V")  # Símbolo por defecto ahora es 1HZ50V
 TIMEFRAME = os.getenv("TIMEFRAME", "1m")
-TRADE_AMOUNT_PERCENTAGE = float(os.getenv("TRADE_AMOUNT_PERCENTAGE", 0.01))
-MIN_TRADE_AMOUNT = 5.0
-MAX_TRADE_AMOUNT = 10.0
-MIN_DIFF_THRESHOLD = 50  # Ajustamos el umbral para BTC (puede que necesites ajustar)
-MODEL_PATH = "trading_model_btc.h5"  # Cambiamos el nombre del modelo para BTC
+FIXED_TRADE_AMOUNT = 10.0  # Monto fijo de inversión
+MIN_DIFF_THRESHOLD = 0.5  # Ajustamos el umbral para CRASH500, (Este valor puede necesitar ajustes)
+MODEL_PATH = "trading_model_crash500.h5"  # Cambiamos el nombre del modelo para CRASH500
 TIMEFRAME_MAP = {
     "1m": 60,
     "5m": 300,
@@ -180,69 +178,62 @@ def predict_price(model, data, scaler):
         console.print(f"[bold red]Error en predicción: {str(e)}[/bold red]")
         return None
 
+async def retry_api_call(api_call, *args, max_retries=3, base_delay=1):
+    """Realiza una llamada al API con reintentos y retroceso exponencial."""
+    for attempt in range(max_retries):
+        try:
+            return await api_call(*args)
+        except Exception as e:
+            console.print(f"[bold red]Intento {attempt + 1} fallido: {e}[/bold red]")
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)  # Retroceso exponencial
+            await asyncio.sleep(delay)
+
 async def get_balance(account_id):
     """Obtiene el balance de la cuenta."""
-    for _ in range(3):
-        try:
-            response = await api.balance({"balance": 1, "account": account_id})
-            return response["balance"]["balance"]
-        except Exception as e:
-            console.print(f"[bold red]Error obteniendo balance: {str(e)}[/bold red]")
-            await asyncio.sleep(5)
-    return None
+    response = await retry_api_call(api.balance, {"balance": 1, "account": account_id})
+    if response and "balance" in response:
+      return response["balance"]["balance"]
+    else:
+      console.print("[bold red]No se pudo obtener el balance de la cuenta.[/bold red]")
+      return None # Si hay error, retornamos None y evitamos el error.
 
 async def get_market_data(symbol, timeframe, count=180):
-    """Obtiene los datos del mercado usando DerivAPI."""
-    for _ in range(3):
-        try:
-            granularity = TIMEFRAME_MAP[timeframe]
-            response = await api.ticks_history({
-                "ticks_history": symbol,
-                "style": "candles",
-                "granularity": granularity,
-                "count": count,
-                "end": "latest",
-            })
+    """Obtiene los datos del mercado usando DerivAPI con reintentos."""
+    granularity = TIMEFRAME_MAP[timeframe]
+    response = await retry_api_call(api.ticks_history, {
+        "ticks_history": symbol,
+        "style": "candles",
+        "granularity": granularity,
+        "count": count,
+        "end": "latest",
+    })
 
-            if "error" in response:
-                console.print(
-                    f"[bold red]Error en la respuesta de la API: {response['error']['code']} - {response['error']['message']}[/bold red]"
-                )
-                await asyncio.sleep(10)
-                continue
-
-            # Verificar si la respuesta contiene 'candles'
-            if "candles" in response:
-                prices = np.array([candle["close"] for candle in response["candles"]], dtype=float)
-                return prices  # Retorna los precios si la respuesta es válida
-            else:
-                console.print(f"[bold red]Respuesta de API no contiene datos de velas.[/bold red]")
-                return None  # Retorna None si no hay datos de velas
-
-        except Exception as e:
-            console.print(f"[bold red]Error en datos: {str(e)}[/bold red]")
-            await asyncio.sleep(10)
-    return None  # Retorna None después de varios intentos fallidos
-
-async def execute_trade(direction, balance, symbol, predicted_price, current_price, confidence):
+    if response and "candles" in response:
+      prices = np.array([candle["close"] for candle in response["candles"]], dtype=float)
+      return prices
+    
+    console.print(f"[bold red]No se obtuvieron datos de velas válidos.[/bold red]")
+    return None
+    
+async def execute_trade(direction, symbol, predicted_price, current_price, confidence):
     """Ejecuta una operación de compra o venta."""
     try:
-        raw_amount = balance * TRADE_AMOUNT_PERCENTAGE * confidence # Ajusta el tamaño del trade según la confianza
-        trade_amount = np.clip(raw_amount, MIN_TRADE_AMOUNT, MAX_TRADE_AMOUNT)
-        trade_amount = round(float(trade_amount), 2)
+        trade_amount = FIXED_TRADE_AMOUNT
 
         console.print(
             f"[green]⌛ Ejecutando {direction} - ${trade_amount:.2f} (Pred: {predicted_price:.5f}, Actual: {current_price:.5f}, Confianza: {confidence:.2f})[/green]"
         )
 
-        # Parámetros del trade para multipliers
+        # Parámetros del trade para vanilla options
         parameters = {
             "amount": trade_amount,
             "basis": "stake",
-            "contract_type": direction, # "MULTUP" o "MULTDOWN"
+            "contract_type": direction, # "CALL" o "PUT"
             "currency": "USD",
             "symbol": symbol,
-            "stop_loss": STOP_LOSS_PERCENTAGE,
+             "stop_loss": STOP_LOSS_PERCENTAGE,
              "take_profit": TAKE_PROFIT_PERCENTAGE,
         }
         
@@ -278,7 +269,7 @@ async def monitor_and_close_trade(contract_id):
     try:
       
       while open_trades.get(contract_id):
-        portfolio = await api.portfolio({"portfolio": 1})
+        portfolio = await retry_api_call(api.portfolio, {"portfolio": 1}, max_retries=5)
         if "error" in portfolio:
           console.print(f"[bold red]Error portfolio: {portfolio['error']}[/bold red]")
           await asyncio.sleep(10)
@@ -293,7 +284,7 @@ async def monitor_and_close_trade(contract_id):
               
               if profit >= (open_trades[contract_id]["trade_amount"] * TAKE_PROFIT_PERCENTAGE):
                   console.print(f"[bold green]Beneficio objetivo alcanzado. Cerrando trade.[/bold green]")
-                  sell_response = await api.sell({"sell": 1, "contract_id": contract_id})
+                  sell_response = await retry_api_call(api.sell, {"sell": 1, "contract_id": contract_id}, max_retries=5)
                   console.print(f"[bold green]Trade cerrado: {sell_response}[/bold green]")
                   
                   # Registrar trade exitoso
@@ -313,7 +304,7 @@ async def monitor_and_close_trade(contract_id):
                   
               elif profit < 0 and abs(profit) >= (open_trades[contract_id]["trade_amount"] * STOP_LOSS_PERCENTAGE):
                   console.print(f"[bold yellow]Stop-loss alcanzado. Cerrando trade.[/bold yellow]")
-                  sell_response = await api.sell({"sell": 1, "contract_id": contract_id})
+                  sell_response = await retry_api_call(api.sell, {"sell": 1, "contract_id": contract_id}, max_retries=5)
                   console.print(f"[bold yellow]Trade cerrado (stop-loss): {sell_response}[/bold yellow]")
                    # Registrar trade fallido
                   trade_history.append({
@@ -325,7 +316,7 @@ async def monitor_and_close_trade(contract_id):
                       "end_time": time.time(),
                       "profit": profit,
                       "confidence":open_trades[contract_id]['confidence'],
-                       "status": "loss"
+                      "status": "loss"
                   })
                   del open_trades[contract_id]
                   return True
@@ -417,17 +408,25 @@ def adjust_trading_parameters():
 
 async def trading_strategy():
     """Función principal que ejecuta la estrategia de trading."""
-    global api, session, open_trades, confidence_level, trade_counter # Mantener estos globales para una limpieza adecuada
-    session = aiohttp.ClientSession()
-    api = DerivAPI(app_id=APP_ID, session=session)
+    global open_trades, confidence_level, trade_counter  # Mantener estos globales para una limpieza adecuada
+
     last_trade_time = 0
+    session = None
+    api = None
 
     try:
-        auth = await api.authorize({"authorize": API_TOKEN})
+        session = aiohttp.ClientSession()
+        api = DerivAPI(app_id=APP_ID, session=session)
+
+        auth = await retry_api_call(api.authorize, {"authorize": API_TOKEN})
         account_id = auth["authorize"]["loginid"]
         console.print(f"[bold blue]🔑 Autenticado en la cuenta: {account_id}[/bold blue]")
 
-        balance = await get_balance(account_id) or 0.0
+        balance = await get_balance(account_id)
+        if balance is None: # En caso de error al obtener el balance, terminamos
+            console.print(f"[bold red]No se pudo obtener el balance inicial, terminando...[/bold red]")
+            return
+
         console.print(f"[bold green]💰 Balance inicial: {balance:.2f} USD[/bold green]")
 
         model = create_model()
@@ -458,40 +457,48 @@ async def trading_strategy():
 
             if predicted_price is not None:
                 price_diff = abs(predicted_price - current_price)  # Definir price_diff AQUÍ
-                
+
                 # Realizar análisis de tendencia
                 trend = await analyze_trend(prices)
 
-                if price_diff >= MIN_DIFF_THRESHOLD and (current_time - last_trade_time >= TRADE_FREQUENCY):
-                  if len(open_trades) < MAX_OPEN_TRADES:
-                    
-                    direction = None
-                    if trend == 'up' and predicted_price > current_price:
-                        direction = "MULTUP"
-                    elif trend == 'down' and predicted_price < current_price:
-                        direction = "MULTDOWN"
-                    
-                    if direction:
-                        contract_id = await execute_trade(direction, balance, SYMBOL, predicted_price, current_price, confidence_level)
-                        if contract_id:
-                            console.print(f"[bold magenta]💰 Balance (antes del trade): {balance:.2f} USD[/bold magenta]")  # Imprimir antes del trade
-                            trade_closed = await monitor_and_close_trade(contract_id)
-                            if trade_closed:
-                                balance = await get_balance(account_id) or balance
-                                console.print(f"[bold magenta]💰 Balance (después del trade): {balance:.2f} USD[/bold magenta]")  # Imprimir después del trade
-                            else:
-                                console.print(f"[bold red]Fallo en el monitoreo/cierre del trade.")
-                            last_trade_time = current_time
-                            trade_counter += 1
-                    else:
-                        console.print(f"[bold yellow]Tendencia no confirmada o predicción no favorable, trade omitido[/bold yellow]")
-                  else:
-                      console.print(f"[bold yellow]Máximo de trades simultáneos alcanzado, espera...[/bold yellow]")
+                if price_diff >= MIN_DIFF_THRESHOLD and (
+                    current_time - last_trade_time >= TRADE_FREQUENCY
+                ):
+                    if len(open_trades) < MAX_OPEN_TRADES:
+                        direction = None
+                        if trend == "up" and predicted_price > current_price:
+                            direction = "CALL"
+                        elif trend == "down" and predicted_price < current_price:
+                            direction = "PUT"
 
-            
+                        if direction:
+                            contract_id = await execute_trade(
+                                direction, SYMBOL, predicted_price, current_price, confidence_level
+                            )
+                            if contract_id:
+                                console.print(
+                                    f"[bold magenta]💰 Balance (antes del trade): {balance:.2f} USD[/bold magenta]"
+                                )  # Imprimir antes del trade
+                                trade_closed = await monitor_and_close_trade(contract_id)
+                                if trade_closed:
+                                    balance = await get_balance(account_id) or balance
+                                    console.print(
+                                        f"[bold magenta]💰 Balance (después del trade): {balance:.2f} USD[/bold magenta]"
+                                    )  # Imprimir después del trade
+                                else:
+                                    console.print(f"[bold red]Fallo en el monitoreo/cierre del trade.")
+                                last_trade_time = current_time
+                                trade_counter += 1
+                        else:
+                            console.print(
+                                f"[bold yellow]Tendencia no confirmada o predicción no favorable, trade omitido[/bold yellow]"
+                            )
+                    else:
+                        console.print(f"[bold yellow]Máximo de trades simultáneos alcanzado, espera...[/bold yellow]")
+
             if trade_counter % 5 == 0:
-              update_confidence(trade_history) # Actualizamos la confianza cada 5 trades
-              adjust_trading_parameters() # Ajustamos los parametros cada 5 trades
+                update_confidence(trade_history)  # Actualizamos la confianza cada 5 trades
+                adjust_trading_parameters()  # Ajustamos los parametros cada 5 trades
 
             await asyncio.sleep(10)  # Verificar el precio cada 10 segundos
 
@@ -499,19 +506,16 @@ async def trading_strategy():
         console.print(f"[bold red]🔥 Error crítico: {str(e)}[/bold red]")
         if "The truth value of an array" in str(e):
             console.print(f"[bold red]❌ Detalle del error: {e}[/bold red]")
-            if 'current_price' in locals():
+            if "current_price" in locals():
                 console.print(f"[bold red]❌ current_price: {current_price}[/bold red]")
             else:
                 console.print(f"[bold red]❌ current_price no está definido.[/bold red]")
-            if 'predicted_price' in locals():
+            if "predicted_price" in locals():
                 console.print(f"[bold red]❌ predicted_price: {predicted_price}[/bold red]")
             else:
                 console.print(f"[bold red]❌ predicted_price no está definido.[/bold red]")
 
     finally:
-        if api:
-            await api.disconnect()
-            console.print("[bold blue]🔌 Conexión finalizada[/bold blue]")
         if session:
             await session.close()
             console.print("[bold blue]🔌 Sesión HTTP cerrada[/bold blue]")

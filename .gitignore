@@ -1,2 +1,4 @@
 .env
 trading_model_v3.h5
+trading_model_btc.h5
+.gitignore
